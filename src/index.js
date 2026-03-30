@@ -257,6 +257,199 @@ app.post('/api/send', authMiddleware, async (req, res) => {
   }
 })
 
+// ── Campaign batch sending (con auth) ──────────────────────────────────
+// Envío masivo con delays anti-ban: 8-12s entre mensajes, pausa 60-90s cada 50
+// Recibe destinatarios + credenciales Supabase para actualizar progreso
+
+const { createClient: createSupabaseClient } = require('@supabase/supabase-js')
+
+// Campañas activas (para cancelación local rápida)
+const activeCampaigns = new Map() // campana_id -> { cancelled: boolean }
+
+function randomBetween(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+// Procesar campaña en background
+async function processCampaign(campanaId, mensaje, destinatarios, supabaseUrl, supabaseKey) {
+  const supabase = createSupabaseClient(supabaseUrl, supabaseKey)
+  const campaign = { cancelled: false }
+  activeCampaigns.set(campanaId, campaign)
+
+  let enviados = 0
+  let errores = 0
+  let sentInBatch = 0
+
+  console.log(`📨 Campaña ${campanaId}: iniciando envío a ${destinatarios.length} contactos`)
+
+  for (const dest of destinatarios) {
+    // Verificar cancelación (local + DB)
+    if (campaign.cancelled) {
+      console.log(`🛑 Campaña ${campanaId}: cancelada localmente`)
+      break
+    }
+
+    // Cada 10 mensajes, verificar cancelación en DB
+    if (sentInBatch > 0 && sentInBatch % 10 === 0) {
+      try {
+        const { data } = await supabase
+          .from('campanas')
+          .select('cancelado')
+          .eq('id', campanaId)
+          .single()
+        if (data?.cancelado) {
+          console.log(`🛑 Campaña ${campanaId}: cancelada desde DB`)
+          campaign.cancelled = true
+          break
+        }
+      } catch (err) {
+        console.warn(`⚠️ Error verificando cancelación: ${err.message}`)
+      }
+    }
+
+    // Enviar mensaje
+    try {
+      if (!clientReady) {
+        throw new Error('WhatsApp desconectado durante el envío')
+      }
+
+      const chatId = dest.telefono.replace(/\D/g, '') + '@c.us'
+
+      // Verificar que el número esté registrado
+      const isRegistered = await waClient.isRegisteredUser(chatId)
+      if (!isRegistered) {
+        throw new Error(`Número ${dest.telefono} no registrado en WhatsApp`)
+      }
+
+      // Personalizar mensaje con nombre si existe
+      const msgPersonalizado = dest.nombre
+        ? mensaje.replace(/\{nombre\}/g, dest.nombre)
+        : mensaje
+
+      await waClient.sendMessage(chatId, msgPersonalizado)
+      enviados++
+      lastActivity = Date.now()
+      console.log(`  ✅ [${enviados + errores}/${destinatarios.length}] Enviado a ${dest.telefono}`)
+
+      // Actualizar progreso en Supabase
+      await supabase.from('campanas').update({
+        enviados_count: enviados,
+      }).eq('id', campanaId)
+
+      // Actualizar destinatario individual
+      await supabase.from('campana_destinatarios')
+        .update({ estado: 'enviado', enviado_at: new Date().toISOString() })
+        .eq('campana_id', campanaId)
+        .eq('telefono', dest.telefono)
+        .eq('estado', 'pendiente')
+        .limit(1)
+
+    } catch (err) {
+      errores++
+      console.log(`  ❌ [${enviados + errores}/${destinatarios.length}] Error ${dest.telefono}: ${err.message}`)
+
+      await supabase.from('campanas').update({
+        errores_count: errores,
+      }).eq('id', campanaId).catch(() => {})
+
+      await supabase.from('campana_destinatarios')
+        .update({ estado: 'error' })
+        .eq('campana_id', campanaId)
+        .eq('telefono', dest.telefono)
+        .eq('estado', 'pendiente')
+        .limit(1)
+        .catch(() => {})
+    }
+
+    sentInBatch++
+
+    // Si no es el último, esperar
+    if (sentInBatch < destinatarios.length) {
+      if (sentInBatch % 50 === 0) {
+        // Pausa larga cada 50 mensajes (60-90 segundos)
+        const pausaSeg = randomBetween(60, 90)
+        console.log(`  ⏸️  Pausa de ${pausaSeg}s después de ${sentInBatch} mensajes...`)
+        await sleep(pausaSeg * 1000)
+      } else {
+        // Delay normal entre mensajes (8-12 segundos)
+        const delay = randomBetween(8000, 12000)
+        await sleep(delay)
+      }
+    }
+  }
+
+  // Finalizar campaña
+  const estadoFinal = campaign.cancelled ? 'cancelado' : 'enviado'
+  await supabase.from('campanas').update({
+    estado: estadoFinal,
+    enviados_count: enviados,
+    errores_count: errores,
+    enviado_at: estadoFinal === 'enviado' ? new Date().toISOString() : null,
+  }).eq('id', campanaId).catch(() => {})
+
+  activeCampaigns.delete(campanaId)
+  console.log(`📨 Campaña ${campanaId}: finalizada — ${enviados} enviados, ${errores} errores, estado: ${estadoFinal}`)
+}
+
+// Iniciar campaña (fire-and-forget)
+app.post('/api/campaign/start', authMiddleware, (req, res) => {
+  const { campana_id, mensaje, destinatarios, supabase_url, supabase_key } = req.body
+
+  if (!campana_id || !mensaje || !destinatarios || !Array.isArray(destinatarios)) {
+    return res.status(400).json({ error: 'campana_id, mensaje y destinatarios[] son requeridos' })
+  }
+
+  if (!supabase_url || !supabase_key) {
+    return res.status(400).json({ error: 'supabase_url y supabase_key son requeridos' })
+  }
+
+  if (!clientReady) {
+    return res.status(503).json({
+      error: 'WhatsApp no está conectado',
+      status: connectionStatus,
+    })
+  }
+
+  // Calcular tiempo estimado
+  const totalSegs = (destinatarios.length * 10) + (Math.floor(destinatarios.length / 50) * 75)
+  const tiempoMin = Math.ceil(totalSegs / 60)
+
+  // Iniciar procesamiento en background (NO await)
+  processCampaign(campana_id, mensaje, destinatarios, supabase_url, supabase_key)
+    .catch(err => {
+      console.error(`❌ Error fatal en campaña ${campana_id}:`, err.message)
+    })
+
+  // Responder inmediatamente
+  res.json({
+    accepted: true,
+    campana_id,
+    destinatarios_count: destinatarios.length,
+    tiempo_estimado_min: tiempoMin,
+  })
+})
+
+// Cancelar campaña
+app.post('/api/campaign/cancel', authMiddleware, (req, res) => {
+  const { campana_id } = req.body
+  if (!campana_id) {
+    return res.status(400).json({ error: 'campana_id requerido' })
+  }
+
+  const campaign = activeCampaigns.get(campana_id)
+  if (campaign) {
+    campaign.cancelled = true
+    console.log(`🛑 Campaña ${campana_id}: cancelación solicitada`)
+    res.json({ cancelled: true, campana_id })
+  } else {
+    res.json({ cancelled: false, campana_id, message: 'Campaña no encontrada o ya finalizada' })
+  }
+})
+
 // Logout (con auth)
 app.post('/api/logout', authMiddleware, async (req, res) => {
   try {
