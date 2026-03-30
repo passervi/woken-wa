@@ -202,11 +202,28 @@ app.get('/api/qr', authMiddleware, async (req, res) => {
   }
 })
 
-// Estado (con auth)
-app.get('/api/status', authMiddleware, (req, res) => {
+// Estado (con auth) — incluye info del número conectado
+app.get('/api/status', authMiddleware, async (req, res) => {
+  let telefono = null
+  let nombre_perfil = null
+
+  if (clientReady) {
+    try {
+      const info = waClient.info
+      if (info) {
+        telefono = info.wid?.user || null
+        nombre_perfil = info.pushname || null
+      }
+    } catch {
+      // silent
+    }
+  }
+
   res.json({
     status: connectionStatus,
     ready: clientReady,
+    telefono,
+    nombre_perfil,
     uptime: Math.floor(process.uptime()),
   })
 })
