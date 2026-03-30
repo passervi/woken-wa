@@ -292,7 +292,7 @@ function sleep(ms) {
 }
 
 // Procesar campaña en background
-async function processCampaign(campanaId, mensaje, destinatarios, supabaseUrl, supabaseKey) {
+async function processCampaign(campanaId, mensaje, destinatarios, supabaseUrl, supabaseKey, media) {
   const supabase = createSupabaseClient(supabaseUrl, supabaseKey)
   const campaign = { cancelled: false }
   activeCampaigns.set(campanaId, campaign)
@@ -347,7 +347,16 @@ async function processCampaign(campanaId, mensaje, destinatarios, supabaseUrl, s
         ? mensaje.replace(/\{nombre\}/g, dest.nombre)
         : mensaje
 
-      await waClient.sendMessage(chatId, msgPersonalizado)
+      // Enviar con media si existe
+      if (media && media.data && media.mimetype) {
+        const waMedia = new MessageMedia(media.mimetype, media.data, media.filename || null)
+        await waClient.sendMessage(chatId, waMedia, {
+          caption: msgPersonalizado || '',
+          sendMediaAsDocument: media.mimetype === 'application/pdf',
+        })
+      } else {
+        await waClient.sendMessage(chatId, msgPersonalizado)
+      }
       enviados++
       lastActivity = Date.now()
       console.log(`  ✅ [${enviados + errores}/${destinatarios.length}] Enviado a ${dest.telefono}`)
@@ -414,7 +423,7 @@ async function processCampaign(campanaId, mensaje, destinatarios, supabaseUrl, s
 
 // Iniciar campaña (fire-and-forget)
 app.post('/api/campaign/start', authMiddleware, (req, res) => {
-  const { campana_id, mensaje, destinatarios, supabase_url, supabase_key } = req.body
+  const { campana_id, mensaje, destinatarios, supabase_url, supabase_key, media } = req.body
 
   if (!campana_id || !mensaje || !destinatarios || !Array.isArray(destinatarios)) {
     return res.status(400).json({ error: 'campana_id, mensaje y destinatarios[] son requeridos' })
@@ -436,7 +445,7 @@ app.post('/api/campaign/start', authMiddleware, (req, res) => {
   const tiempoMin = Math.ceil(totalSegs / 60)
 
   // Iniciar procesamiento en background (NO await)
-  processCampaign(campana_id, mensaje, destinatarios, supabase_url, supabase_key)
+  processCampaign(campana_id, mensaje, destinatarios, supabase_url, supabase_key, media || null)
     .catch(err => {
       console.error(`❌ Error fatal en campaña ${campana_id}:`, err.message)
     })
