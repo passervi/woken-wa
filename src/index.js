@@ -476,6 +476,25 @@ app.post('/api/campaign/cancel', authMiddleware, (req, res) => {
   }
 })
 
+// Reinicializar cliente (con auth) — fuerza nuevo QR
+app.post('/api/restart', authMiddleware, async (req, res) => {
+  try {
+    console.log('🔄 Reinicializando cliente WhatsApp...')
+    clientReady = false
+    currentQR = null
+    connectionStatus = 'disconnected'
+    try { await waClient.destroy() } catch { /* ignore */ }
+    setTimeout(() => {
+      waClient.initialize().catch(err => {
+        console.error('❌ Error reinicializando:', err.message)
+      })
+    }, 1000)
+    res.json({ ok: true, message: 'Reinicializando... el QR estará disponible en ~5 segundos' })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // Logout (con auth)
 app.post('/api/logout', authMiddleware, async (req, res) => {
   try {
